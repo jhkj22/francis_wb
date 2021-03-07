@@ -4,9 +4,10 @@ use html5ever::rcdom::{Handle, Node, NodeData, RcDom};
 use html5ever::serialize;
 use html5ever::serialize::SerializeOpts;
 use html5ever::tendril::TendrilSink;
-use layout::DeviceContext;
+use layout::{DeviceContext, Size};
 use std::{
-    cell::RefCell,
+    borrow::BorrowMut,
+    cell::{Cell, RefCell},
     fmt::{Display, Formatter},
     fs::File,
 };
@@ -229,7 +230,7 @@ mod layout {
         rc::{Rc, Weak},
     };
 
-    #[derive(Debug)]
+    #[derive(Clone, Copy, PartialEq, Debug)]
     pub struct Size {
         pub width: u32,
         pub height: u32,
@@ -244,7 +245,7 @@ mod layout {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Copy, PartialEq, Debug)]
     pub struct Point {
         pub x: i32,
         pub y: i32,
@@ -361,8 +362,8 @@ mod layout {
 #[derive(Debug)]
 struct TextBlock {
     text: String,
-    pos: layout::Point,
-    size: layout::Size,
+    pos: Cell<layout::Point>,
+    size: Cell<layout::Size>,
     min_width: u32,
     max_width: u32,
 }
@@ -376,8 +377,8 @@ impl TextBlock {
 
         TextBlock {
             text: text.to_string(),
-            pos: layout::Point::new(),
-            size: size,
+            pos: Cell::new(layout::Point::new()),
+            size: Cell::new(size),
             min_width: min_width,
             max_width: max_width,
         }
@@ -415,6 +416,7 @@ struct Table {
     cols: u32,
     min_width_cols: Vec<u32>,
     max_width_cols: Vec<u32>,
+    size: Size,
     cells: Vec<TableCell>,
 }
 
@@ -425,57 +427,21 @@ impl Table {
             cols: 0,
             min_width_cols: vec![],
             max_width_cols: vec![],
+            size: Size::new(),
             cells: vec![],
         }
     }
-}
 
-impl Display for Table {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        writeln!(
-            f,
-            "Table = rows: {}, cols: {}, min_width_cols: {:?}, max_width_cols: {:?}",
-            self.rows, self.cols, self.min_width_cols, self.max_width_cols
-        )?;
+    fn new_from(table_node: &Handle) -> Table {
+        let mut table = Table::new();
 
-        for (i, cell) in self.cells.iter().enumerate() {
-            writeln!(f, "{}: {:}\n", i, cell)?;
-        }
-
-        Ok(())
-    }
-}
-
-#[test]
-fn test() {
-    let dc = layout::TestDC::new();
-    let size = dc.measure_text("ab\nc");
-    println!("{:?}", size);
-}
-
-#[tokio::main]
-async fn main() -> () {
-    //fetch().await.expect("");
-    let html_data = load();
-    let parser = parse_document(RcDom::default(), ParseOpts::default());
-    let dom = parser.one(html_data);
-
-    //println!("{}", dom.document.children.borrow().len());
-
-    let node = &dom.document.children.borrow()[1];
-    remove_decoration(node);
-
-    let table_nodes = find_elements(node, "table");
-    for table_node in table_nodes {
         let tbody_node = find_elements(&table_node, "tbody");
         if tbody_node.len() != 1 {
-            continue;
+            return table;
         }
 
         let tbody_node = tbody_node[0].clone();
         let tr_nodes = find_elements(&tbody_node, "tr");
-
-        let mut table = Table::new();
 
         table.rows = tr_nodes.len() as u32;
 
@@ -508,15 +474,119 @@ async fn main() -> () {
             }
         }
 
-        if let Some(v) = table
+        table.cols = table
             .cells
             .iter()
             .map(|cell| cell.col_range.iter().max().unwrap_or(&0))
             .max()
-        {
-            table.cols = v + 1;
-        };
+            .map(|v| v + 1)
+            .unwrap_or(0);
 
+        for col in 0..table.cols {
+            let max_width = table
+                .cells
+                .iter()
+                .map(|cell| {
+                    cell.col_range
+                        .iter()
+                        .find(|c| **c == col)
+                        .map(|_| {
+                            let ratio = 1f32 / cell.col_range.len() as f32;
+                            let block_width = cell.text_block.size.get().width;
+                            let guess_width = (block_width as f32 * ratio) as u32;
+                            guess_width
+                        })
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+
+            table.max_width_cols.push(max_width);
+            table.size.width += max_width;
+        }
+
+        for row in 0..table.rows {
+            let max_height = table
+                .cells
+                .iter()
+                .map(|cell| {
+                    cell.row_range
+                        .iter()
+                        .find(|r| **r == row)
+                        .map(|_| cell.text_block.size.get().height)
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+
+            table.size.height += max_height;
+        }
+
+        let xs: Vec<u32> = table
+            .max_width_cols
+            .iter()
+            .scan(0, |prev, w| Some(*prev + w))
+            .collect();
+
+        let ys: Vec<u32> = (0..table.rows)
+            .scan(0, |prev, _| Some(*prev + 20))
+            .collect();
+
+        for cell in table.cells.iter() {
+            let row = *cell.row_range.iter().min().unwrap();
+            let col = *cell.col_range.iter().min().unwrap();
+            let x = xs[col as usize] as i32;
+            let y = ys[row as usize] as i32;
+            cell.text_block.pos.set(layout::Point { x: x, y: y })
+        }
+
+        for cell in table.cells.iter() {
+            let mut size = cell.text_block.size.get();
+
+            size.width = cell
+                .col_range
+                .iter()
+                .map(|c| table.max_width_cols[*c as usize])
+                .fold(0, |sum, w| sum + w);
+
+            cell.text_block.size.set(size);
+        }
+
+        table
+    }
+}
+
+impl Display for Table {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        writeln!(
+            f,
+            "Table = rows: {}, cols: {}, min_width_cols: {:?}, max_width_cols: {:?}",
+            self.rows, self.cols, self.min_width_cols, self.max_width_cols
+        )?;
+
+        for (i, cell) in self.cells.iter().enumerate() {
+            writeln!(f, "{}: {:}\n", i, cell)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> () {
+    //fetch().await.expect("");
+    let html_data = load();
+    let parser = parse_document(RcDom::default(), ParseOpts::default());
+    let dom = parser.one(html_data);
+
+    //println!("{}", dom.document.children.borrow().len());
+
+    let node = &dom.document.children.borrow()[1];
+    remove_decoration(node);
+
+    let table_nodes = find_elements(node, "table");
+    for table_node in table_nodes {
+        let table = Table::new_from(&table_node);
         println!("{:}", table);
         println!("------------------------------");
     }
@@ -524,4 +594,140 @@ async fn main() -> () {
     //let mut bytes = vec![];
     //serialize(&mut bytes, &dom.document, SerializeOpts::default()).unwrap();
     //println!("{}", String::from_utf8(bytes).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn measure_text() {
+        let dc = layout::TestDC::new();
+        let size = dc.measure_text("ab\nc");
+        assert_eq!(
+            size,
+            layout::Size {
+                width: 40,
+                height: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn table() {
+        let html_data = r##"
+        <table>
+        <tbody>
+            <tr>
+                <td colspan="2">1543年頃 - 1596年1月28日</td>
+            </tr>
+            <tr>
+                <th>生誕</th>
+                <td>イングランド、デヴォン、タヴィストック</td>
+            </tr>
+            <tr>
+                <th>最終階級</th>
+                <td>イギリス海軍中将</td>
+            </tr>
+        </tbody>
+        </table>
+        "##;
+
+        // max-width
+        // ----------
+        // 380
+        //  40, 380
+        //  80, 160
+        // ----------
+        // 190, 380
+
+        let parser = parse_document(RcDom::default(), ParseOpts::default());
+        let dom = parser.one(html_data);
+        let node = &dom.document.children.borrow()[0];
+
+        let table = Table::new_from(&node);
+        //println!("{:}", table);
+
+        assert_eq!(table.rows, 3);
+        assert_eq!(table.cols, 2);
+
+        assert_eq!(
+            table.size,
+            Size {
+                width: 570,
+                height: 60
+            }
+        );
+
+        assert_eq!(
+            table.cells[0].text_block.pos.get(),
+            layout::Point { x: 0, y: 0 }
+        );
+        assert_eq!(
+            table.cells[1].text_block.pos.get(),
+            layout::Point { x: 0, y: 20 }
+        );
+        assert_eq!(
+            table.cells[2].text_block.pos.get(),
+            layout::Point { x: 190, y: 20 }
+        );
+        assert_eq!(
+            table.cells[3].text_block.pos.get(),
+            layout::Point { x: 0, y: 40 }
+        );
+        assert_eq!(
+            table.cells[4].text_block.pos.get(),
+            layout::Point { x: 190, y: 40 }
+        );
+
+        assert_eq!(table.cells[0].text_block.size.get().width, 570);
+        assert_eq!(table.cells[1].text_block.size.get().width, 190);
+        assert_eq!(table.cells[2].text_block.size.get().width, 380);
+        assert_eq!(table.cells[3].text_block.size.get().width, 190);
+        assert_eq!(table.cells[4].text_block.size.get().width, 380);
+    }
+
+    #[test]
+    fn table_width() {
+        let html_data = r##"
+        <table style="width: 300px;">
+        <tbody>
+            <tr>
+                <td colspan="2">1543年頃 - 1596年1月28日</td>
+            </tr>
+            <tr>
+                <th>生誕</th>
+                <td>イングランド、デヴォン、タヴィストック</td>
+            </tr>
+            <tr>
+                <th>最終階級</th>
+                <td>イギリス海軍中将</td>
+            </tr>
+        </tbody>
+        </table>
+        "##;
+
+        // max-width
+        // ----------
+        // 380
+        //  40, 380
+        //  80, 160
+        // ----------
+        // 190, 380  = 570
+
+        // width = 300
+        // 100, 200
+
+        let parser = parse_document(RcDom::default(), ParseOpts::default());
+        let dom = parser.one(html_data);
+        let node = &dom.document.children.borrow()[0];
+
+        let table = Table::new_from(&node);
+        //println!("{:}", table);
+    }
 }
