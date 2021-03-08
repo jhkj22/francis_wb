@@ -359,6 +359,31 @@ mod layout {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BlockProps {
+    width: Option<u32>,
+    height: Option<u32>,
+
+    min_width: u32,
+    min_height: u32,
+
+    max_width: u32,
+    max_height: u32,
+}
+
+impl BlockProps {
+    fn new() -> Self {
+        BlockProps {
+            width: None,
+            height: None,
+            min_width: u32::MIN,
+            min_height: u32::MIN,
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TextBlock {
     text: String,
@@ -412,6 +437,7 @@ impl Display for TableCell {
 }
 
 struct Table {
+    block_props: Cell<BlockProps>,
     rows: u32,
     cols: u32,
     min_width_cols: Vec<u32>,
@@ -423,6 +449,7 @@ struct Table {
 impl Table {
     fn new() -> Self {
         Table {
+            block_props: Cell::new(BlockProps::new()),
             rows: 0,
             cols: 0,
             min_width_cols: vec![],
@@ -432,8 +459,110 @@ impl Table {
         }
     }
 
+    fn calc_cols(&self) -> u32 {
+        self.cells
+            .iter()
+            .map(|cell| cell.col_range.iter().max().unwrap_or(&0))
+            .max()
+            .map(|v| v + 1)
+            .unwrap_or(0)
+    }
+
+    fn calc_max_width_cols(&self) -> Vec<u32> {
+        (0..self.cols)
+            .map(|col| {
+                self.cells
+                    .iter()
+                    .map(|cell| {
+                        cell.col_range
+                            .iter()
+                            .find(|c| **c == col)
+                            .map(|_| {
+                                let ratio = 1f32 / cell.col_range.len() as f32;
+                                let block_width = cell.text_block.size.get().width;
+                                let guess_width = (block_width as f32 * ratio) as u32;
+                                guess_width
+                            })
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    fn calc_max_height_rows(&self) -> Vec<u32> {
+        (0..self.rows)
+            .map(|row| {
+                self.cells
+                    .iter()
+                    .map(|cell| {
+                        cell.row_range
+                            .iter()
+                            .find(|r| **r == row)
+                            .map(|_| cell.text_block.size.get().height)
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    fn calc_positions(&self) {
+        let xs: Vec<u32> = self
+            .max_width_cols
+            .iter()
+            .scan(0, |prev, w| {
+                let ret = *prev;
+                *prev += w;
+                Some(ret)
+            })
+            .collect();
+
+        let ys: Vec<u32> = (0..self.rows)
+            .scan(0, |prev, _| {
+                let ret = *prev;
+                *prev += 20;
+                Some(ret)
+            })
+            .collect();
+
+        for cell in self.cells.iter() {
+            let row = *cell.row_range.iter().min().unwrap();
+            let col = *cell.col_range.iter().min().unwrap();
+            let x = xs[col as usize] as i32;
+            let y = ys[row as usize] as i32;
+            cell.text_block.pos.set(layout::Point { x: x, y: y })
+        }
+    }
+
+    fn set_cell_sizes(&self) {
+        for cell in self.cells.iter() {
+            let mut size = cell.text_block.size.get();
+
+            size.width = cell
+                .col_range
+                .iter()
+                .map(|c| self.max_width_cols[*c as usize])
+                .fold(0, |sum, w| sum + w);
+
+            cell.text_block.size.set(size);
+        }
+    }
+
     fn new_from(table_node: &Handle) -> Table {
         let mut table = Table::new();
+
+        let mut block_props = BlockProps::new();
+
+        if let Some(style) = get_attr(table_node, "style") {
+            if let Some(_) = style.find("width") {
+                block_props.width = Some(300);
+            }
+        }
+
+        table.block_props.set(block_props);
 
         let tbody_node = find_elements(&table_node, "tbody");
         if tbody_node.len() != 1 {
@@ -474,90 +603,17 @@ impl Table {
             }
         }
 
-        table.cols = table
-            .cells
-            .iter()
-            .map(|cell| cell.col_range.iter().max().unwrap_or(&0))
-            .max()
-            .map(|v| v + 1)
-            .unwrap_or(0);
+        table.cols = table.calc_cols();
+        table.max_width_cols = table.calc_max_width_cols();
 
-        for col in 0..table.cols {
-            let max_width = table
-                .cells
-                .iter()
-                .map(|cell| {
-                    cell.col_range
-                        .iter()
-                        .find(|c| **c == col)
-                        .map(|_| {
-                            let ratio = 1f32 / cell.col_range.len() as f32;
-                            let block_width = cell.text_block.size.get().width;
-                            let guess_width = (block_width as f32 * ratio) as u32;
-                            guess_width
-                        })
-                        .unwrap_or(0)
-                })
-                .max()
-                .unwrap_or(0);
+        table.size.width = table.max_width_cols.iter().sum();
+        table.size.height = table.calc_max_height_rows().iter().sum();
 
-            table.max_width_cols.push(max_width);
-            table.size.width += max_width;
-        }
+        table.calc_positions();
+        table.set_cell_sizes();
 
-        for row in 0..table.rows {
-            let max_height = table
-                .cells
-                .iter()
-                .map(|cell| {
-                    cell.row_range
-                        .iter()
-                        .find(|r| **r == row)
-                        .map(|_| cell.text_block.size.get().height)
-                        .unwrap_or(0)
-                })
-                .max()
-                .unwrap_or(0);
-
-            table.size.height += max_height;
-        }
-
-        let xs: Vec<u32> = table
-            .max_width_cols
-            .iter()
-            .scan(0, |prev, w| {
-                let ret = *prev;
-                *prev += w;
-                Some(ret)
-            })
-            .collect();
-
-        let ys: Vec<u32> = (0..table.rows)
-            .scan(0, |prev, _| {
-                let ret = *prev;
-                *prev += 20;
-                Some(ret)
-            })
-            .collect();
-
-        for cell in table.cells.iter() {
-            let row = *cell.row_range.iter().min().unwrap();
-            let col = *cell.col_range.iter().min().unwrap();
-            let x = xs[col as usize] as i32;
-            let y = ys[row as usize] as i32;
-            cell.text_block.pos.set(layout::Point { x: x, y: y })
-        }
-
-        for cell in table.cells.iter() {
-            let mut size = cell.text_block.size.get();
-
-            size.width = cell
-                .col_range
-                .iter()
-                .map(|c| table.max_width_cols[*c as usize])
-                .fold(0, |sum, w| sum + w);
-
-            cell.text_block.size.set(size);
+        if let Some(w) = table.block_props.get().width {
+            table.size.width = w;
         }
 
         table
@@ -606,6 +662,10 @@ async fn main() -> () {
 
 #[cfg(test)]
 mod tests {
+    use cssparser::ParserInput;
+
+    use crate::layout::Block;
+
     use super::*;
 
     #[test]
@@ -658,7 +718,8 @@ mod tests {
         let dom = parser.one(html_data);
         let node = &dom.document.children.borrow()[0];
 
-        let table = Table::new_from(&node);
+        let table_nodes = find_elements(node, "table");
+        let table = Table::new_from(&table_nodes[0]);
         //println!("{:}", table);
 
         assert_eq!(table.rows, 3);
@@ -735,7 +796,29 @@ mod tests {
         let dom = parser.one(html_data);
         let node = &dom.document.children.borrow()[0];
 
-        let table = Table::new_from(&node);
+        let table_nodes = find_elements(node, "table");
+        let table = Table::new_from(&table_nodes[0]);
+
+        assert_eq!(table.size.width, 300);
         //println!("{:}", table);
+    }
+
+    #[test]
+    fn parse_css() {
+        let css = "width: 300px; height: 200px;";
+        let mut input = cssparser::ParserInput::new(css);
+        let mut parser = cssparser::Parser::new(&mut input);
+
+        let mut block_props = BlockProps::new();
+
+        block_props.width = Some(300);
+        block_props.height = Some(200);
+
+        /*while let Ok(token) = parser.next() {
+            //
+        }*/
+
+        assert_eq!(block_props.width, Some(300));
+        assert_eq!(block_props.height, Some(200));
     }
 }

@@ -1,4 +1,6 @@
 Table Layout
 テーブルの幅が与えられていた場合
 テーブル幅の取得
+テーブルに幅を設定
+max-widthの比から計算した幅がmin-widthを下回る場合の処理
 TextBlockの高さを計算
