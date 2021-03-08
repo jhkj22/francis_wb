@@ -525,11 +525,19 @@ impl Table {
         let xs: Vec<u32> = table
             .max_width_cols
             .iter()
-            .scan(0, |prev, w| Some(*prev + w))
+            .scan(0, |prev, w| {
+                let ret = *prev;
+                *prev += w;
+                Some(ret)
+            })
             .collect();
 
         let ys: Vec<u32> = (0..table.rows)
-            .scan(0, |prev, _| Some(*prev + 20))
+            .scan(0, |prev, _| {
+                let ret = *prev;
+                *prev += 20;
+                Some(ret)
+            })
             .collect();
 
         for cell in table.cells.iter() {
