@@ -4,7 +4,7 @@ use html5ever::rcdom::{Handle, Node, NodeData, RcDom};
 use html5ever::serialize;
 use html5ever::serialize::SerializeOpts;
 use html5ever::tendril::TendrilSink;
-use layout::{DeviceContext, Size};
+use layout::{Block, DeviceContext, Size};
 use std::{
     borrow::BorrowMut,
     cell::{Cell, RefCell},
@@ -382,6 +382,55 @@ impl BlockProps {
             max_height: u32::MAX,
         }
     }
+
+    fn new_from(css: &str) -> Self {
+        let mut input = cssparser::ParserInput::new(css);
+        let mut parser = cssparser::Parser::new(&mut input);
+
+        let mut prop_pairs: Vec<(String, i32)> = vec![];
+        let mut current_prop: Option<String> = None;
+
+        while let Ok(token) = parser.next() {
+            //println!("{:?}", token);
+
+            use cssparser::Token;
+
+            match token {
+                Token::Ident(v) => {
+                    current_prop = String::from_utf8(v.as_bytes().to_vec()).ok();
+                }
+                Token::Dimension {
+                    has_sign,
+                    value,
+                    int_value,
+                    unit,
+                } => {
+                    if let Some(prop) = &current_prop {
+                        if let Some(value) = int_value {
+                            prop_pairs.push((prop.to_string(), *value));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut block_props = BlockProps::new();
+
+        for prop in prop_pairs {
+            match prop.0.as_str() {
+                "width" => block_props.width = Some(prop.1 as u32),
+                "height" => block_props.height = Some(prop.1 as u32),
+                "min-width" => block_props.min_width = prop.1 as u32,
+                "min-height" => block_props.min_height = prop.1 as u32,
+                "max-width" => block_props.max_width = prop.1 as u32,
+                "max-height" => block_props.min_height = prop.1 as u32,
+                _ => {}
+            }
+        }
+
+        block_props
+    }
 }
 
 #[derive(Debug)]
@@ -554,15 +603,9 @@ impl Table {
     fn new_from(table_node: &Handle) -> Table {
         let mut table = Table::new();
 
-        let mut block_props = BlockProps::new();
-
         if let Some(style) = get_attr(table_node, "style") {
-            if let Some(_) = style.find("width") {
-                block_props.width = Some(300);
-            }
+            table.block_props.set(BlockProps::new_from(&style));
         }
-
-        table.block_props.set(block_props);
 
         let tbody_node = find_elements(&table_node, "tbody");
         if tbody_node.len() != 1 {
@@ -662,10 +705,6 @@ async fn main() -> () {
 
 #[cfg(test)]
 mod tests {
-    use cssparser::ParserInput;
-
-    use crate::layout::Block;
-
     use super::*;
 
     #[test]
@@ -805,20 +844,11 @@ mod tests {
 
     #[test]
     fn parse_css() {
-        let css = "width: 300px; height: 200px;";
-        let mut input = cssparser::ParserInput::new(css);
-        let mut parser = cssparser::Parser::new(&mut input);
-
-        let mut block_props = BlockProps::new();
-
-        block_props.width = Some(300);
-        block_props.height = Some(200);
-
-        /*while let Ok(token) = parser.next() {
-            //
-        }*/
+        let css = "max-width: 400px; width: 300px; height: 200px;";
+        let block_props = BlockProps::new_from(css);
 
         assert_eq!(block_props.width, Some(300));
         assert_eq!(block_props.height, Some(200));
+        assert_eq!(block_props.max_width, 400);
     }
 }
